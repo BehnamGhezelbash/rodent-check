@@ -59,8 +59,9 @@ h1{font-size:2.1rem; font-weight:800; line-height:1.1; margin:0 0 8px; letter-sp
 .settings label{font-weight:600; font-size:.95rem}
 .settings input,.settings select{
   font:inherit; color:var(--ink); background:var(--bg); border:1.5px solid var(--line);
-  border-radius:8px; padding:9px 10px; width:100%;
+  border-radius:8px; padding:9px 10px; width:100%; box-sizing:border-box; min-width:0;
 }
+.settings .row > *{min-width:0}
 .settings input:focus-visible,.settings select:focus-visible{outline:3px solid var(--safety); outline-offset:1px}
 .settings .small{font-size:.88rem; color:var(--muted); margin:4px 0 0}
 .settings .btns{justify-content:flex-start; margin-top:12px}
@@ -385,17 +386,57 @@ Reply with only JSON, no other text, in exactly this shape:
 x and y give the approximate centre of the finding inside that tile, as a percentage of the tile's width measured from the left edge and of its height measured from the top edge. Use an empty findings array when a tile shows nothing. Include every tile id (${ids.join(", ")}) exactly once.`;
   }
 
-  async function callModel(tiles, img, signal) {
+  const FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"];
+
+  function buildParts(tiles, img) {
     const parts = [];
     for (const t of tiles) {
       parts.push({ text: `Tile ${t.id}:` });
       parts.push({ inlineData: { mimeType: "image/jpeg", data: tileBase64(img, t.crop) } });
     }
     parts.push({ text: buildPrompt(tiles.map((t) => t.id)) });
+    return parts;
+  }
 
+  function sleep(ms, signal) {
+    return new Promise((res, rej) => {
+      const t = setTimeout(res, ms);
+      signal?.addEventListener("abort", () => { clearTimeout(t); rej({ kind: "cancelled" }); }, { once: true });
+    });
+  }
+
+  // Tries the chosen model, retries once if Google is busy, then falls back to other free models.
+  async function callWithFallback(tiles, img, signal) {
+    const parts = buildParts(tiles, img);
+    const order = [cfg.model, ...FALLBACK_MODELS.filter((m) => m !== cfg.model)];
+    let lastErr = null;
+    for (let i = 0; i < order.length; i++) {
+      const model = order[i];
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          return { res: await requestModel(parts, model, signal), model };
+        } catch (e) {
+          lastErr = e;
+          if (e?.kind === "cancelled") throw e;
+          if (e?.kind === "http" && e.status >= 500 && attempt === 0) {
+            setStatus(`Google is busy. Retrying ${model}…`);
+            await sleep(3000, signal);
+            continue;
+          }
+          break;
+        }
+      }
+      const canMoveOn = lastErr?.kind === "http" && (lastErr.status >= 500 || lastErr.status === 404 || lastErr.status === 429);
+      if (!canMoveOn || i === order.length - 1) throw lastErr;
+      setStatus(`${model} didn’t answer. Trying ${order[i + 1]}…`);
+    }
+    throw lastErr;
+  }
+
+  async function requestModel(parts, model, signal) {
     let r;
     try {
-      r = await fetch(`${API_BASE}${encodeURIComponent(cfg.model)}:generateContent`, {
+      r = await fetch(`${API_BASE}${encodeURIComponent(model)}:generateContent`, {
         method: "POST",
         signal,
         headers: { "content-type": "application/json", "x-goog-api-key": cfg.key },
@@ -437,7 +478,7 @@ x and y give the approximate centre of the finding inside that tile, as a percen
       if (e.status === 429 || e.gstatus === "RESOURCE_EXHAUSTED") return "Free limit reached. Wait a minute, or try again tomorrow if the daily limit is used up.";
       if (e.status === 404 || /not found|not supported for generateContent/i.test(e.msg)) return "That model name isn’t available. Pick another in Settings.";
       if (e.status === 401 || e.status === 403) return "This key isn’t allowed to use the API. Check it in Google AI Studio.";
-      if (e.status >= 500) return "Google’s API is busy right now. Try again in a minute.";
+      if (e.status >= 500) return "Google’s servers didn’t answer for any of the free models. Try again in a few minutes.";
       return "The request failed" + (e.msg ? ": " + e.msg : ".");
     }
     return "Something went wrong. Try again.";
@@ -463,14 +504,16 @@ x and y give the approximate centre of the finding inside that tile, as a percen
 
     const ctl = new AbortController();
     state.ctl = ctl;
-    let res;
+    let res, usedModel;
     try {
-      res = await callModel(tiles, img, ctl.signal);
+      ({ res, model: usedModel } = await callWithFallback(tiles, img, ctl.signal));
     } catch (e) {
       tiles.forEach((t) => cellEl(t.id)?.classList.remove("scanning"));
       setBusy(false);
       state.ctl = null;
-      setStatus(e?.kind === "cancelled" ? "Check stopped." : errorText(e), e?.kind !== "cancelled");
+      if (e?.kind === "cancelled") { setStatus("Check stopped."); return; }
+      const detail = e?.kind === "http" && (e.msg || e.status) ? ` [Google ${e.status}${e.msg ? ": " + String(e.msg).slice(0, 220) : ""}]` : "";
+      setStatus(errorText(e) + detail, true);
       return;
     }
     state.ctl = null;
@@ -503,7 +546,7 @@ x and y give the approximate centre of the finding inside that tile, as a percen
       const el = cellEl(t.id);
       if (el) { el.classList.remove("scanning"); el.classList.add(topConf >= 70 ? "flag" : topConf >= 40 ? "suspect" : "clear"); }
     });
-    setStatus("");
+    setStatus(usedModel !== cfg.model ? `Checked with ${usedModel} because ${cfg.model} was busy.` : "");
     render(dedupe(all), [...quality], look);
   }
 
